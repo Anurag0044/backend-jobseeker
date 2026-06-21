@@ -4,3 +4,13 @@ python-dotenv
 firebase-admin
 pydantic
 pydantic-settings
+google-adk
+httpx
+beautifulsoup4
+lxml
+PyPDF2
+python-multipart
+slowapi
+pytest
+pytest-asyncio
+loguru
