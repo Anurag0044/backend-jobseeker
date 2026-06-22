@@ -11,3 +11,5 @@ services:
         sync: false
       - key: LOG_LEVEL
         value: INFO
+      - key: ENVIRONMENT
+        value: production

@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
-VALID_JOB_URL = "https://example.com/jobs/senior-engineer"
+VALID_JOB_URL = "https://boards.greenhouse.io/openai/jobs/senior-engineer"
 VALID_RESUME_CONTENT = (
     b"Jane Doe\njane@example.com\n\n"
     b"EXPERIENCE\n"
@@ -120,10 +120,9 @@ async def test_full_pipeline_valid_inputs_returns_200(client, mock_firebase_toke
 @pytest.mark.asyncio
 async def test_pipeline_invalid_job_url_returns_422(client, mock_firebase_token):
     """
-    A job URL without a valid scheme (no https://) must be rejected with 422
-    before any agent runs. The scraper's _validate_url check enforces this.
+    A job URL without a valid scheme must be rejected with 422
+    before any agent runs. The input sanitizer enforces this.
     """
-    # We do NOT mock the scraper here — we let the real URL validator run.
     response = await _post_generate(
         client,
         files={
@@ -137,32 +136,56 @@ async def test_pipeline_invalid_job_url_returns_422(client, mock_firebase_token)
     )
 
     assert response.status_code == 422
-    assert "Invalid job URL" in response.json()["detail"]
+    # The sanitizer raises 422 with a scheme or invalid-URL message.
+    detail = response.json()["detail"].lower()
+    assert "scheme" in detail or "invalid" in detail or "url" in detail
 
 
 @pytest.mark.asyncio
-async def test_pipeline_oversized_resume_returns_413(client, mock_firebase_token):
+async def test_pipeline_oversized_resume_returns_413(monkeypatch):
     """
-    A resume whose extracted text exceeds 50 000 characters must return 413
-    Request Entity Too Large before the pipeline runs.
+    A resume whose extracted text exceeds 50 000 characters must return 422
+    (sanitize_resume_text raises 422) before the pipeline runs.
+
+    Uses a unique UID ('oversized-test-uid') not used by any other test so
+    the rate limiter counter starts at zero for this request.
     """
-    # Create a TXT file whose content exceeds the 50 000-char limit.
+    import firebase_admin
+    import firebase_admin.auth as fb_auth
+
+    unique_token = {
+        "uid": "oversized-test-uid",
+        "email": "oversized@test.com",
+        "email_verified": True,
+    }
+    monkeypatch.setattr(firebase_admin, "_apps", {"[DEFAULT]": object()})
+    monkeypatch.setattr(fb_auth, "verify_id_token", lambda t, **kw: unique_token)
+
+    from httpx import ASGITransport, AsyncClient
+    from main import app
+
     oversized_content = b"A" * 51_000
 
-    response = await _post_generate(
-        client,
-        files={
-            "resume_file": (
-                "resume.txt",
-                oversized_content,
-                "text/plain",
-            )
-        },
-        data={"job_url": VALID_JOB_URL},
-    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as fresh_client:
+        response = await fresh_client.post(
+            "/api/v1/generate",
+            headers={"Authorization": "Bearer fake-valid-token"},
+            files={
+                "resume_file": (
+                    "resume.txt",
+                    oversized_content,
+                    "text/plain",
+                )
+            },
+            data={"job_url": VALID_JOB_URL},
+        )
 
-    assert response.status_code == 413
+    # sanitize_resume_text raises 422 for text > 50 000 chars.
+    assert response.status_code == 422
     assert "too long" in response.json()["detail"].lower()
+
 
 
 @pytest.mark.asyncio

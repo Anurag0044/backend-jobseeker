@@ -3,15 +3,11 @@ middleware/firebase_auth.py
 ───────────────────────────
 Firebase ID token verification dependency for FastAPI.
 
-Changes from Phase 2:
-  - Attaches decoded UID to request.state.user_uid so the rate limiter
-    (slowapi) can use it as a rate-limit key without re-reading the token.
-  - Adds loguru INFO / WARNING logs on auth success / failure.
-  - Core verification logic (firebase_admin.auth.verify_id_token) is
-    unchanged.
-
-Note: verify_firebase_token now requires `request: Request` as a parameter
-so it can write to request.state. FastAPI resolves this automatically.
+Phase 5 change:
+  - All log lines now include [request_id] prefix for log correlation.
+  - request_id is read from request.state.request_id (guaranteed to exist
+    because RequestIDMiddleware runs before auth is evaluated).
+  - Core verification logic (firebase_admin.auth.verify_id_token) is unchanged.
 """
 
 import json
@@ -42,14 +38,13 @@ def verify_firebase_token(
     """
     FastAPI dependency: verify the Bearer token and return the decoded dict.
 
-    Side-effect: sets request.state.user_uid so downstream components
-    (rate limiter, orchestrator) can read the UID without re-parsing the
-    token.
+    Side-effects:
+      - Sets request.state.user_uid for the rate limiter key function.
+      - Logs auth success/failure with [request_id] prefix.
 
     Args:
-        request:             The current FastAPI Request (injected by FastAPI).
-        credentials_header:  HTTP Bearer credentials parsed from the
-                             Authorization header.
+        request:             The current FastAPI Request.
+        credentials_header:  HTTP Bearer credentials from Authorization header.
 
     Returns:
         Decoded Firebase token dict (contains 'uid', 'email', etc.).
@@ -57,8 +52,10 @@ def verify_firebase_token(
     Raises:
         HTTPException 401: Missing or invalid/expired token.
     """
+    request_id: str = getattr(request.state, "request_id", "unknown")
+
     if credentials_header is None:
-        logger.warning("Auth failed: Authorization header missing.")
+        logger.warning("[{}] Auth failed — Authorization header missing.", request_id)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authorization header missing.",
@@ -69,16 +66,18 @@ def verify_firebase_token(
     try:
         decoded_token: dict = auth.verify_id_token(token)
     except Exception as exc:
-        logger.warning("Auth failed: token verification error — {}", str(exc))
+        logger.warning(
+            "[{}] Auth failed — token verification error: {}",
+            request_id,
+            str(exc),
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token.",
         ) from exc
 
     uid: str = decoded_token.get("uid", "unknown")
-
-    # ── Attach UID to request state for the rate limiter ─────────────────────
     request.state.user_uid = uid
 
-    logger.info("Auth verified for UID: {}", uid)
+    logger.info("[{}] Auth verified — UID: {}", request_id, uid)
     return decoded_token

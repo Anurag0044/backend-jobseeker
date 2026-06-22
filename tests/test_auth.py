@@ -98,7 +98,7 @@ async def test_generate_valid_token_passes_auth(client, mock_firebase_token):
                         "text/plain",
                     )
                 },
-                data={"job_url": "https://example.com/jobs/valid"},
+                data={"job_url": "https://boards.greenhouse.io/jobs/valid"},
             )
 
     # Must not be 401 — auth passed.

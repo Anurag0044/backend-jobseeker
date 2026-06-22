@@ -3,35 +3,75 @@ main.py
 ───────
 Job Seeker's Concierge — FastAPI application entry point.
 
-Phase 4 additions:
-  - Loguru structured logging configured at import time.
-  - SlowAPI rate limiter wired to app.state and exception handler.
-  - Deep health check endpoint: GET /health/deep
-    Verifies Firebase Admin SDK initialization and Gemini API connectivity.
+Phase 5 additions:
+  - RequestIDMiddleware:    first middleware — every request gets a UUID.
+  - SecurityHeadersMiddleware: second — wraps all responses with security
+    headers.
+  - CORSMiddleware:         third.
+  - Centralised error handlers (HTTPException, RequestValidationError,
+    Exception catch-all) replace the previous bare SlowAPI handler.
+  - Startup env-var validation: crashes immediately with a clear message
+    if GEMINI_API_KEY or FIREBASE_SERVICE_ACCOUNT_JSON are missing.
+  - ENVIRONMENT variable drives log context (production / development).
 """
-
+from dotenv import load_dotenv
+load_dotenv()
+import os
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 import firebase_admin
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIASGIMiddleware
 
+from core.error_handlers import (
+    generic_exception_handler,
+    http_exception_handler,
+    validation_error_handler,
+)
 from core.logger import logger
 from core.rate_limiter import limiter, rate_limit_exceeded_handler
 from middleware.firebase_auth import _initialize_firebase
+from middleware.request_id import RequestIDMiddleware
+from middleware.security_headers import SecurityHeadersMiddleware
 from routers import generate
+
+
+# ── Startup env-var guard ─────────────────────────────────────────────────────
+def _assert_env_vars() -> None:
+    """
+    Crash immediately with a readable message if required env vars are missing.
+    This surfaces configuration errors at startup rather than at runtime.
+    """
+    missing: list[str] = []
+    if not os.environ.get("GEMINI_API_KEY"):
+        missing.append("GEMINI_API_KEY")
+    if not os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON"):
+        missing.append("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if missing:
+        print(
+            f"\n[FATAL] Missing required environment variables: {', '.join(missing)}\n"
+            "Set them in your .env file or Render.com environment settings.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application startup / shutdown lifecycle handler."""
-    logger.info("Job Seeker's Concierge API starting up...")
+    environment = os.environ.get("ENVIRONMENT", "development")
+    logger.info(
+        "Job Seeker's Concierge API v2.1.0 starting up — environment: {}",
+        environment,
+    )
+    _assert_env_vars()
     _initialize_firebase()
     logger.info("Firebase Admin SDK initialized.")
     yield
@@ -44,16 +84,23 @@ app = FastAPI(
         "Secure AI-powered backend for resume tailoring, cover letter generation, "
         "and job application assistance. Auth: Firebase. AI: Gemini (ADK)."
     ),
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
-# ── Rate limiter ──────────────────────────────────────────────────────────────
+# ── Rate limiter (must come before middleware stack) ──────────────────────────
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIASGIMiddleware)
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
+# ── Middleware stack (order is CRITICAL — last added = outermost) ─────────────
+# Execution order for a request:   RequestID → SecurityHeaders → CORS → handler
+# Execution order for a response:  handler → CORS → SecurityHeaders → RequestID
+#
+# add_middleware() inserts at the FRONT of the stack, so we add in REVERSE order.
+# Add CORSMiddleware first (innermost), then SecurityHeaders, then RequestID
+# (outermost — runs first on request, last on response).
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Lock down in Phase 6
@@ -61,6 +108,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestIDMiddleware)
+
+# ── Exception handlers ────────────────────────────────────────────────────────
+app.add_exception_handler(HTTPException, http_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_error_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(generate.router, prefix="/api/v1")
@@ -75,21 +129,17 @@ def health_check() -> dict:
 
 # ── Deep health check ─────────────────────────────────────────────────────────
 @app.get("/health/deep", tags=["Health"])
-async def deep_health_check(response: Response) -> JSONResponse:
+async def deep_health_check(request: Request, response: Response) -> JSONResponse:
     """
-    Readiness probe — verifies both Firebase and Gemini connectivity.
-
-    Checks:
-      1. Firebase Admin SDK has an initialized app.
-      2. Gemini API responds to a minimal generate_content call.
+    Readiness probe — verifies Firebase Admin SDK and Gemini API connectivity.
 
     Returns:
       200  { "status": "healthy",   "firebase": "connected",
-             "gemini": "connected", "timestamp": "<ISO>" }
-      503  { "status": "degraded",  "firebase": "<status>",
-             "gemini": "<status>",  "timestamp": "<ISO>",
-             "error": "<detail>" }
+             "gemini": "connected", "timestamp": "<ISO>",
+             "request_id": "<uuid>" }
+      503  { "status": "degraded",  ... "error": "<detail>" }
     """
+    request_id: str = getattr(request.state, "request_id", "unknown")
     timestamp: str = datetime.now(timezone.utc).isoformat()
     firebase_status: str = "unknown"
     gemini_status: str = "unknown"
@@ -105,7 +155,9 @@ async def deep_health_check(response: Response) -> JSONResponse:
     except Exception as exc:
         firebase_status = "error"
         error_detail = f"Firebase check failed: {exc!r}"
-        logger.error("Deep health: Firebase check error — {}", repr(exc))
+        logger.error(
+            "[{}] Deep health: Firebase check error — {}", request_id, repr(exc)
+        )
 
     # ── Check 2: Gemini ───────────────────────────────────────────────────────
     try:
@@ -117,7 +169,6 @@ async def deep_health_check(response: Response) -> JSONResponse:
             model="gemini-2.5-flash",
             contents="respond with OK",
         )
-        # Accept any non-empty response as a sign the API is reachable.
         if gemini_response and gemini_response.text:
             gemini_status = "connected"
         else:
@@ -126,25 +177,28 @@ async def deep_health_check(response: Response) -> JSONResponse:
     except Exception as exc:
         gemini_status = "error"
         error_detail = error_detail or f"Gemini check failed: {exc!r}"
-        logger.error("Deep health: Gemini check error — {}", repr(exc))
+        logger.error(
+            "[{}] Deep health: Gemini check error — {}", request_id, repr(exc)
+        )
 
     # ── Build response ────────────────────────────────────────────────────────
     all_healthy: bool = (
         firebase_status == "connected" and gemini_status == "connected"
     )
-
     payload: dict = {
         "status": "healthy" if all_healthy else "degraded",
         "firebase": firebase_status,
         "gemini": gemini_status,
         "timestamp": timestamp,
+        "request_id": request_id,
     }
     if error_detail:
         payload["error"] = error_detail
 
-    http_status: int = 200 if all_healthy else 503
+    http_status = 200 if all_healthy else 503
     logger.info(
-        "Deep health check: firebase={} gemini={} → HTTP {}",
+        "[{}] Deep health: firebase={} gemini={} → HTTP {}",
+        request_id,
         firebase_status,
         gemini_status,
         http_status,

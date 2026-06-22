@@ -3,19 +3,15 @@ agents/resume_agent.py
 ──────────────────────
 Agent 2 — The Resume Optimizer.
 
-Responsibility:
-  Accept the candidate's original resume text and the structured job insights
-  dict produced by Agent 1, then produce an ATS-optimized resume in Markdown.
-
-Anti-hallucination guarantees (enforced at TWO levels):
-  1. System prompt — an explicit HARD RULE instructs the model never to
-     invent roles, skills, dates, or experiences not in the original resume.
-  2. Post-processing — the returned Markdown is verified for:
-     a. Non-emptiness.
-     b. Length >= 50% of the input (guards against truncated responses).
-     c. Reference-line ratio check (80% of capitalized phrases preserved).
+Phase 5 hardening:
+  1. tenacity retry (3 attempts, exponential backoff) on Gemini transient errors.
+  2. validate_no_hallucination() — date-level and proper-noun-level checks:
+     - Any 4-digit year in optimized output not present in original → raises 500.
+     - > 3 new capitalised proper nouns → logs WARNING (does not raise).
+  3. Output length guard: if < 50% of original length, retry once before raising.
 """
 
+import re
 import uuid
 
 from fastapi import HTTPException
@@ -23,8 +19,25 @@ from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from core.logger import logger
+
+try:
+    from google.api_core.exceptions import (
+        DeadlineExceeded,
+        ResourceExhausted,
+        ServiceUnavailable,
+    )
+    _RETRYABLE = (ServiceUnavailable, DeadlineExceeded, ResourceExhausted)
+except ImportError:
+    _RETRYABLE = (Exception,)  # type: ignore[assignment]
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 _SYSTEM_PROMPT = (
@@ -49,7 +62,6 @@ _APP_NAME = "resume_optimizer_agent"
 
 
 def _build_agent() -> LlmAgent:
-    """Construct a fresh LlmAgent for resume optimization."""
     return LlmAgent(
         name="resume_optimizer",
         model="gemini-2.5-flash",
@@ -57,65 +69,140 @@ def _build_agent() -> LlmAgent:
     )
 
 
-def _extract_company_names(resume_text: str) -> list[str]:
-    """
-    Heuristic: collect capitalised multi-word lines from the original resume
-    that are likely company or organisation names.
-    """
-    candidates: list[str] = []
-    for line in resume_text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith(("-", "*", "#", ">")):
-            continue
-        words = stripped.split()
-        cap_words = [w for w in words if w and w[0].isupper()]
-        if len(cap_words) >= 2:
-            candidates.append(stripped)
-    return candidates[:20]
-
-
-def _validate_no_hallucination(
-    original_resume: str, optimized_resume: str
-) -> bool:
-    """
-    Post-processing anti-hallucination guard.
-
-    Returns True if >= 80% of reference lines from the original are still
-    present in the optimized output.
-    """
-    reference_lines = _extract_company_names(original_resume)
-    if not reference_lines:
-        return True
-
-    hits = sum(
-        1 for line in reference_lines if line.lower() in optimized_resume.lower()
+def _log_retry(retry_state: RetryCallState) -> None:
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    logger.warning(
+        "Agent 2 — Gemini call failed (attempt {}), retrying… exc={}",
+        retry_state.attempt_number,
+        repr(exc),
     )
-    ratio = hits / len(reference_lines)
-    logger.debug(
-        "Resume hallucination check: {}/{} reference lines found ({:.0f}%).",
-        hits,
-        len(reference_lines),
-        ratio * 100,
+
+
+def validate_no_hallucination(
+    original: str,
+    optimized: str,
+    request_id: str = "",
+) -> str:
+    """
+    Post-processing hallucination guard for the optimized resume.
+
+    Checks:
+      1. Any 4-digit year (e.g. 2019, 2023) present in `optimized` but NOT
+         in `original` is a fabricated date → raises HTTPException 500.
+      2. More than 3 new capitalised proper nouns (4+ chars) in `optimized`
+         that are not in `original` → logs WARNING (does not raise, as some
+         rephrasing is expected).
+
+    Args:
+        original:   The candidate's original resume text.
+        optimized:  The Gemini-generated optimized resume text.
+        request_id: Trace ID for log correlation.
+
+    Returns:
+        The validated optimized resume string (unchanged if it passes).
+
+    Raises:
+        HTTPException 500: If fabricated dates are detected.
+    """
+    # ── Check 1: Date hallucination ───────────────────────────────────────────
+    original_years: set[str] = set(re.findall(r"\b(?:19|20)\d{2}\b", original))
+    optimized_years: set[str] = set(re.findall(r"\b(?:19|20)\d{2}\b", optimized))
+    new_years: set[str] = optimized_years - original_years
+
+    if new_years:
+        logger.error(
+            "[{}] Hallucination detected — new dates found: {}",
+            request_id,
+            sorted(new_years),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Resume optimization produced inconsistent output. Please retry."
+            ),
+        )
+
+    # ── Check 2: Proper noun proliferation ────────────────────────────────────
+    def _proper_nouns(text: str) -> set[str]:
+        return {
+            w for w in re.findall(r"\b[A-Z][a-zA-Z]{3,}\b", text)
+        }
+
+    original_nouns = _proper_nouns(original)
+    optimized_nouns = _proper_nouns(optimized)
+    new_nouns = optimized_nouns - original_nouns
+
+    if len(new_nouns) > 3:
+        logger.warning(
+            "[{}] Agent 2 — {} new proper nouns in optimized resume: {}",
+            request_id,
+            len(new_nouns),
+            sorted(new_nouns)[:10],
+        )
+
+    return optimized
+
+
+async def _run_agent_once(user_prompt: str) -> str:
+    """Single ADK agent invocation — used by both first call and length retry."""
+    session_service = InMemorySessionService()
+    agent = _build_agent()
+    runner = Runner(
+        agent=agent,
+        app_name=_APP_NAME,
+        session_service=session_service,
     )
-    return ratio >= 0.80
+    user_id = "resume_service"
+    session_id = f"resume-{uuid.uuid4().hex}"
+
+    await session_service.create_session(
+        app_name=_APP_NAME,
+        user_id=user_id,
+        session_id=session_id,
+    )
+
+    user_message = types.Content(
+        role="user",
+        parts=[types.Part(text=user_prompt)],
+    )
+
+    result: str = ""
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=user_message,
+    ):
+        if event.is_final_response():
+            if event.content and event.content.parts:
+                result = event.content.parts[0].text or ""
+            break
+    return result
 
 
-async def run_resume_agent(resume_text: str, job_insights: dict) -> str:
+async def run_resume_agent(
+    resume_text: str,
+    job_insights: dict,
+    request_id: str = "",
+) -> str:
     """
     Optimize the candidate's resume for the target job.
 
     Args:
-        resume_text:  The candidate's original resume as plain text.
-        job_insights: Structured dict from the Scraper Agent.
+        resume_text:  Candidate's original resume (sanitized plain text).
+        job_insights: Structured dict from Agent 1.
+        request_id:   Trace ID for log correlation.
 
     Returns:
         Optimized resume as a Markdown string.
 
     Raises:
-        HTTPException 500: If the ADK runner returns an invalid response.
+        HTTPException 500: On empty output, suspicious truncation, or
+                           hallucinated dates after all retries.
     """
     logger.info(
-        "Agent 2 started — resume length: {} characters", len(resume_text)
+        "[{}] Agent 2 started — resume length: {} characters",
+        request_id,
+        len(resume_text),
     )
 
     job_insights_formatted = "\n".join(
@@ -134,87 +221,73 @@ async def run_resume_agent(resume_text: str, job_insights: dict) -> str:
         "original resume. Do NOT add anything that isn't already there."
     )
 
-    # ── Run ADK agent ─────────────────────────────────────────────────────────
-    session_service = InMemorySessionService()
-    agent = _build_agent()
-    runner = Runner(
-        agent=agent,
-        app_name=_APP_NAME,
-        session_service=session_service,
+    logger.info("[{}] Agent 2 — sending to Gemini for optimization", request_id)
+
+    @retry(
+        retry=retry_if_exception_type(_RETRYABLE),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        before_sleep=_log_retry,
+        reraise=True,
     )
+    async def _gemini_with_retry() -> str:
+        return await _run_agent_once(user_prompt)
 
-    user_id = "resume_service"
-    session_id = f"resume-{uuid.uuid4().hex}"
-
-    await session_service.create_session(
-        app_name=_APP_NAME,
-        user_id=user_id,
-        session_id=session_id,
-    )
-
-    user_message = types.Content(
-        role="user",
-        parts=[types.Part(text=user_prompt)],
-    )
-
-    logger.info("Agent 2 — sending to Gemini for optimization")
-
-    optimized_resume: str = ""
     try:
-        async for event in runner.run_async(
-            user_id=user_id,
-            session_id=session_id,
-            new_message=user_message,
-        ):
-            if event.is_final_response():
-                if event.content and event.content.parts:
-                    optimized_resume = event.content.parts[0].text or ""
-                break
+        optimized_resume: str = await _gemini_with_retry()
     except Exception as exc:
-        logger.error("Agent 2 — Gemini runner error: {}", repr(exc))
+        logger.error("[{}] Agent 2 — Gemini runner error: {}", request_id, repr(exc))
         raise HTTPException(
             status_code=500,
             detail="Resume optimization produced invalid output. Please retry.",
         ) from exc
 
-    # ── Post-processing validation ────────────────────────────────────────────
-    # Check 1: non-empty
+    # ── Check 1: non-empty ────────────────────────────────────────────────────
     if not optimized_resume.strip():
-        logger.error("Agent 2 — Gemini returned empty resume output.")
+        logger.error("[{}] Agent 2 — Gemini returned empty resume output.", request_id)
         raise HTTPException(
             status_code=500,
             detail="Resume optimization produced invalid output. Please retry.",
         )
 
-    # Check 2: output length >= 50% of input length (truncation guard)
-    min_expected_length = len(resume_text) * 0.50
-    if len(optimized_resume) < min_expected_length:
-        logger.error(
-            "Agent 2 — output too short ({} chars vs {} input chars). "
-            "Possible truncation.",
+    # ── Check 2: length >= 50% of input (truncation guard with one retry) ─────
+    min_expected = len(resume_text) * 0.50
+    if len(optimized_resume) < min_expected:
+        logger.warning(
+            "[{}] Resume output suspiciously short ({} chars vs {} input) "
+            "— retrying once",
+            request_id,
             len(optimized_resume),
             len(resume_text),
         )
-        raise HTTPException(
-            status_code=500,
-            detail="Resume optimization produced invalid output. Please retry.",
-        )
+        try:
+            optimized_resume = await _run_agent_once(user_prompt)
+        except Exception as exc:
+            logger.error(
+                "[{}] Agent 2 — retry attempt also failed: {}", request_id, repr(exc)
+            )
 
-    # Check 3: anti-hallucination reference-line guard
-    # HARD RULE (code-level enforcement): if the model substantially rewrote
-    # the candidate's identity, fall back to the original resume.
-    if not _validate_no_hallucination(resume_text, optimized_resume):
-        logger.warning(
-            "Agent 2 — hallucination guard triggered. "
-            "Returning original resume as safe fallback."
-        )
-        optimized_resume = (
-            "<!-- WARNING: Optimization guard triggered. "
-            "Original resume returned. -->\n\n" + resume_text
-        )
+        if not optimized_resume.strip() or len(optimized_resume) < min_expected:
+            logger.error(
+                "[{}] Agent 2 — output still too short after retry ({} chars).",
+                request_id,
+                len(optimized_resume),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Resume optimization produced invalid output. Please retry.",
+            )
+
+    # ── Check 3: hallucination guard ──────────────────────────────────────────
+    optimized_resume = validate_no_hallucination(
+        original=resume_text,
+        optimized=optimized_resume,
+        request_id=request_id,
+    )
 
     logger.info(
-        "Agent 2 complete — optimized resume length: {} characters",
+        "[{}] Agent 2 complete — optimized resume length: {} characters",
+        request_id,
         len(optimized_resume),
     )
     return optimized_resume
