@@ -40,7 +40,7 @@ from core.rate_limiter import limiter, rate_limit_exceeded_handler
 from middleware.firebase_auth import _initialize_firebase
 from middleware.request_id import RequestIDMiddleware
 from middleware.security_headers import SecurityHeadersMiddleware
-from routers import whatsapp
+from routers import whatsapp, assistant
 
 
 # ── Startup env-var guard ─────────────────────────────────────────────────────
@@ -120,6 +120,7 @@ app.add_exception_handler(Exception, generic_exception_handler)
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(whatsapp.router, prefix="/api/v1")
+app.include_router(assistant.router, prefix="/api/v1")
 
 
 # ── Basic health check ────────────────────────────────────────────────────────
