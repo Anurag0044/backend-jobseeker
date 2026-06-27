@@ -65,7 +65,8 @@ async def stream_assistant(request: ChatRequest):
                         "event": "message",
                         "data": json.dumps({
                             "type": "tool_end", 
-                            "tool": name
+                            "tool": name,
+                            "output": output
                         })
                     }
             
