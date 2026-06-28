@@ -13,8 +13,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of your local project files into the container
 COPY . .
 
-# Expose the local host port
+# Expose a default port for local development
 EXPOSE 8000
 
-# Launch the FastAPI app matching your local environment settings
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Launch the FastAPI app matching your environment settings.
+# We use the shell form of CMD to dynamically read Render's $PORT variable (defaults to 8000 locally).
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
