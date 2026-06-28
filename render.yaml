@@ -9,6 +9,10 @@ services:
         sync: false
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
       - key: LOG_LEVEL
         value: INFO
       - key: ENVIRONMENT
