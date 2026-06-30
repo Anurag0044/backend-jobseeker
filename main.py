@@ -52,6 +52,10 @@ def _assert_env_vars() -> None:
     missing: list[str] = []
     if not os.environ.get("GEMINI_API_KEY"):
         missing.append("GEMINI_API_KEY")
+    if not os.environ.get("NVIDIA_API_KEY"):
+        missing.append("NVIDIA_API_KEY")
+    if not os.environ.get("TAVILY_API_KEY"):
+        missing.append("TAVILY_API_KEY")
     # Firebase is bypassed for local testing
     if missing:
         print(
@@ -166,7 +170,7 @@ async def deep_health_check(request: Request, response: Response) -> JSONRespons
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
 
-        llm = ChatGoogleGenerativeAI(model="gemini-flash-latest", temperature=0)
+        llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
         gemini_response = llm.invoke("respond with OK")
         if gemini_response and gemini_response.content:
             gemini_status = "connected"

@@ -1,10 +1,19 @@
 services:
   - type: web
     name: job-concierge-api
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+    # Tell Render to build and run via the Dockerfile, not the Python native runner.
+    # This ensures the exact same environment as local docker runs.
+    runtime: docker
+    dockerfilePath: ./dockerfile
+
+    # Health check path — Render probes this URL after deploy to confirm the
+    # service is up before marking the deploy successful.
+    healthCheckPath: /
+
     envVars:
+      # Set to false = Render will NOT auto-sync; you must paste the value
+      # manually in the Render dashboard (keeps secrets out of version control).
       - key: GEMINI_API_KEY
         sync: false
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
@@ -13,6 +22,8 @@ services:
         sync: false
       - key: TAVILY_API_KEY
         sync: false
+
+      # Static values — safe to commit
       - key: LOG_LEVEL
         value: INFO
       - key: ENVIRONMENT

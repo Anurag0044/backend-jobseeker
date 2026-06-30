@@ -60,11 +60,14 @@ async def stream_assistant(request: ChatRequest):
                     
                 # Tool execution finished
                 elif kind == "on_tool_end":
-                    output = event["data"].get("output", "")
+                    # Coerce output to str — tool output can be a non-serialisable
+                    # object (e.g. ToolMessage, dict) which would crash json.dumps.
+                    raw_output = event["data"].get("output", "")
+                    output = str(raw_output) if not isinstance(raw_output, str) else raw_output
                     yield {
                         "event": "message",
                         "data": json.dumps({
-                            "type": "tool_end", 
+                            "type": "tool_end",
                             "tool": name,
                             "output": output
                         })

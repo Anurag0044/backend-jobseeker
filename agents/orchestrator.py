@@ -1,6 +1,5 @@
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain.tools import tool
-from firebase_admin import firestore
 import json
 from langgraph.prebuilt import create_react_agent
 

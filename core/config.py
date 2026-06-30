@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     )
 
     GEMINI_API_KEY: str = ""
+    NVIDIA_API_KEY: str = ""
+    TAVILY_API_KEY: str = ""
     FIREBASE_SERVICE_ACCOUNT_JSON: str = ""
 
     @field_validator("GEMINI_API_KEY")
