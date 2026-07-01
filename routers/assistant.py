@@ -4,14 +4,21 @@ from fastapi import APIRouter, Request, Form, Response, Body
 from sse_starlette.sse import EventSourceResponse
 from core.logger import logger
 from agents.orchestrator import agent_executor
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from pydantic import BaseModel
+from typing import List
 
 router = APIRouter()
 
+class MessageItem(BaseModel):
+    role: str
+    content: str
+
 class ChatRequest(BaseModel):
     message: str
+    history: List[MessageItem] = []
     phone_number: str = "mock_user"
+    mode: str = "expert"
 
 @router.post("/assistant/stream")
 async def stream_assistant(request: ChatRequest):
@@ -26,8 +33,18 @@ async def stream_assistant(request: ChatRequest):
                 "data": json.dumps({"type": "thinking", "status": "Starting thought process..."})
             }
             
+            langchain_messages = []
+            for msg in request.history:
+                if msg.role == 'user':
+                    langchain_messages.append(HumanMessage(content=msg.content))
+                else:
+                    langchain_messages.append(AIMessage(content=msg.content))
+                    
+            langchain_messages.append(HumanMessage(content=request.message))
+            
             initial_state = {
-                "messages": [HumanMessage(content=request.message)]
+                "messages": langchain_messages,
+                "mode": request.mode
             }
             
             # Use LangGraph's astream_events to get real-time hooks
