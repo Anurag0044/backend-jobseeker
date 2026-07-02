@@ -89,22 +89,10 @@ Ensure you have the following installed:
    pip install -r requirements.txt
    ```
 
-4. **Configure environment variables:**
-   Create a `.env` file in the root directory and populate it with your keys:
-   ```env
-   GEMINI_API_KEY=your_gemini_api_key
-   NVIDIA_API_KEY=your_nvidia_api_key
-   TAVILY_API_KEY=your_tavily_api_key
-   
-   # Note: Condense your Firebase JSON into a single line string for the .env file
-   FIREBASE_SERVICE_ACCOUNT_JSON={"type": "service_account", ...}
-   
-   ENVIRONMENT=development
-   LOG_LEVEL=INFO
-   ```
+4. **Set environment variables:**
+   Create a `.env` file in the root directory and add the required API keys and service account JSON file path.
 
----
-
+   ```   
 ## ⚙️ Usage
 
 ### Running Locally
