@@ -95,7 +95,7 @@ async def _invoke_with_fallback(messages, use_tools=False):
             logger.warning(f"Model {model_name} failed: {e}. Trying next...")
     
     # If all models fail, raise the last error
-    raise last_error
+    raise last_error if last_error is not None else RuntimeError("All models failed but no error was captured.")
 
 
 # Define the research node that can loop (uses tools)
